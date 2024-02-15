@@ -1,0 +1,285 @@
+---
+title: "TOL_ratios"
+author: "Marie Zahn"
+date: '2023-07-13'
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Calculate TOL ratios between target frequency bands
+
+```{r load packages and data}
+## load required packages
+library(here)
+library(ggplot2)
+library(PAMpal)
+library(dplyr)
+library(gsignal)
+
+#Set time zone to UTC
+Sys.setenv(TZ = 'UTC')
+
+## full datasets - updated version of PAMGuard
+## events with no detections or those with fewer than 30 were removed from filtered datasets
+## load Fisher data
+load(here("R/Rdata/1hr/Fish_20kHzPG_0kHzPP_1hr_wavTime_filtered_labeled.rdata")) 
+## load Kong Oscar data
+load(here("R/Rdata/1hr/Kong_20kHzPG_0kHzPP_1hr_wavTime_filtered_labeled.rdata"))
+
+```
+
+
+```{r calculate third octave levels}
+## for Base-ten,
+G <- 10**(3/10)
+
+# 16 kHz TOL band ----------
+x <- 42 # band number
+# midband frequency
+(freq_m <- (G**((x-30)/3)*1000))
+# calculate bandedge frequencies
+lower_freq_16kHz <- G**(-1/6)*freq_m # lower
+upper_freq_16kHz <- G**(1/6)*freq_m # upper
+
+# 25 kHz TOL band ----------
+x <- 44 # band number
+# midband frequency
+(freq_m <- (G**((x-30)/3)*1000))
+# calculate bandedge frequencies
+lower_freq_25kHz <- G**(-1/6)*freq_m # lower
+upper_freq_25kHz <- G**(1/6)*freq_m # upper
+
+# 40 kHz TOL band ----------
+x <- 46 # band number
+# midband frequency
+(freq_m <- (G**((x-30)/3)*1000))
+# calculate bandedge frequencies
+lower_freq_40kHz <- G**(-1/6)*freq_m # lower
+upper_freq_40kHz <- G**(1/6)*freq_m # upper
+```
+
+
+Create function to extract TOL and take mean and sum from average spectra (mean and sum taken for comparison)
+
+```{r avgSpec TOL calculations function}
+## option to apply a highpass filter but here I do not apply one
+## calculates avg spectrum then extracts SPL within frequency bands and calculates difference
+
+avgSpec_band_diff <- function(Acoustic_Study, evNum, clipping_level, filterfrom_khz, samp_rate) {
+  ## calculate spectra for narwhal events
+  avSpec_all <- calculateAverageSpectra(Acoustic_Study,wl=512,evNum=evNum,
+                                        plot=FALSE,sort=FALSE,noise=FALSE,
+                                        filterfrom_khz = filterfrom_khz,norm=FALSE)
+  
+  ## extract frequency values and mean spectra
+  freq <- avSpec_all$freq
+  avgSpec <- avSpec_all$avgSpec
+  
+  ## extract spectral data for specified TOL band
+  ## 173 is our system clipping level for SoundTraps
+  ## 206 is the clipping level for the Reson hydrophones
+  ## Because PAMpal has a correction for applying a Hanning window and we don't need that for echolocation clicks, we will remove the correction by adding back the energy it removed:
+  
+  N = 512 # FFT window size
+  fs = samp_rate # sampling rate
+  window = hanning(N) # hanning window applied to waveform
+  correction = 10*log10(sum(window)**2/(N*fs))
+
+  band_16kHz_dB <- (avgSpec[which(freq>lower_freq_16kHz & freq<upper_freq_16kHz)]+clipping_level+correction) # 16 kHz TOL
+  band_25kHz_dB <- (avgSpec[which(freq>lower_freq_25kHz & freq<upper_freq_25kHz)]+clipping_level+correction) # 25 kHz TOL
+  band_40kHz_dB <- (avgSpec[which(freq>lower_freq_40kHz & freq<upper_freq_40kHz)]+clipping_level+correction) # 40 kHz TOL
+  
+  ## because dB is on a log scale, we must convert to linear scale and then take the mean (or sum)
+  ## after taking the mean (or sum), we can convert back to log scale
+  
+  ## taking mean
+  band_16kHz_mean <- mean(10^(band_16kHz_dB/20)) # 16 kHz TOL
+  band_25kHz_mean <- mean(10^(band_25kHz_dB/20)) # 25 kHz TOL
+  band_40kHz_mean <- mean(10^(band_40kHz_dB/20)) # 40 kHz TOL
+  
+  ## take the sum of squared pressures within TOL
+  band_16kHz_sum <- sum((10^(band_16kHz_dB/20))^2) # 16 kHz TOL
+  band_25kHz_sum <- sum((10^(band_25kHz_dB/20))^2) # 25 kHz TOL
+  band_40kHz_sum <- sum((10^(band_40kHz_dB/20))^2) # 40 kHz TOL
+  
+  ## calculate difference between freq bands
+  ## mean
+  TOL_16to25_mean_dB <- 20*log10(band_16kHz_mean / band_25kHz_mean)
+  TOL_25to40_mean_dB <- 20*log10(band_25kHz_mean / band_40kHz_mean)
+  
+  ## sum
+  TOL_16to25_sum_dB <- 10*log10(band_16kHz_sum / band_25kHz_sum)
+  TOL_25to40_sum_dB <- 10*log10(band_25kHz_sum / band_40kHz_sum)
+  
+  ## calculate how many unique clicks are in the dataset
+  n_clicks <- nClicks(Acoustic_Study@events[[evNum]], distinct=TRUE) 
+  
+  ## save mean spectrum
+  df_avgSpec <- data.frame(t(avgSpec))
+  
+  ## extract species ID
+  species_id <- Acoustic_Study@events[[evNum]]@species[["id"]]
+  
+  ## build dataframe with SPL difference and click number data
+  df_TOL_ratio <- data.frame(eventId=evNum,
+                             species=species_id,
+                             TOL_16to25_mean_dB=TOL_16to25_mean_dB, 
+                             TOL_25to40_mean_dB=TOL_25to40_mean_dB,
+                             TOL_16to25_sum_dB=TOL_16to25_sum_dB, 
+                             TOL_25to40_sum_dB=TOL_25to40_sum_dB,
+                             n_dets=n_clicks)
+  
+  ## join both dataframes
+  event_spec_df <- cbind(df_TOL_ratio, df_avgSpec)
+  
+  return(event_spec_df)
+}
+
+```
+
+```{r function to loop through events}
+# function to loop through each event and get SPL difference between bands
+
+calculate_TOL_ratio <- function(Acoustic_Study, clipping_level, filterfrom_khz, samp_rate) {
+  # create empty data frame to fill
+  band_diff_df <- data.frame(eventId=c(),species=c(),
+                             TOL_16to25_mean_dB=c(),TOL_25to40_mean_dB=c(),
+                             TOL_16to25_sum_dB=c(),TOL_25to40_sum_dB=c(),
+                             n_dets=c())
+  
+  for (i in 1:length(Acoustic_Study@events)) {
+    # run function to calculate SPL differences
+    band_diff_df_tmp <- avgSpec_band_diff(Acoustic_Study, evNum=Acoustic_Study@events[[i]]@id, 
+                                          clipping_level, filterfrom_khz, samp_rate)
+    # append dataframe
+    band_diff_df <- rbind(band_diff_df, band_diff_df_tmp)
+  }
+  return(band_diff_df)
+}
+
+```
+
+```{r run functions}
+
+## Fisher Islands
+testing_fish_data_TOL_df <- calculate_TOL_ratio(fish_dets_0kHzPP_filter, clipping_level=173, 
+                                                filterfrom_khz=0, samp_rate=144000)
+## save output
+write.csv(testing_fish_data_TOL_df, 
+          here('R/spreadsheets/TOL_ratios/testing_fish_data_TOL_ratios_0kHz_highpass.csv'),
+          row.names = FALSE)
+
+## Kong Oscar
+testing_kong_data_TOL_df <- calculate_TOL_ratio(kong_dets_0kHzPP_filter, clipping_level=173, 
+                                                filterfrom_khz=0, samp_rate=144000)
+
+## save output
+write.csv(testing_kong_data_TOL_df, 
+          here('R/spreadsheets/TOL_ratios/testing_kong_data_TOL_ratios_0kHz_highpass.csv'),
+          row.names = FALSE)
+
+```
+
+# Export noise spectra for all events
+
+```{r extract avgSpec noise function}
+avgSpec_noise <- function(Acoustic_Study, evNum, clipping_level, wl) {
+  ## calculate spectra for narwhal events
+  avSpec_all <- calculateAverageSpectra(Acoustic_Study,wl=wl,evNum=evNum,
+                                        plot=FALSE,sort=FALSE,noise=FALSE,
+                                        filterfrom_khz = 0,norm=FALSE)
+  
+  ## extract frequency values and mean noise spectra
+  freq <- avSpec_all$freq
+  avgSpec_noise <- avSpec_all$avgNoise
+  
+  ## save mean spectrum
+  df_avgSpec <- data.frame(t(avgSpec_noise))
+
+  ## build dataframe with event number and species
+  df_noise_meta <- data.frame(eventId=evNum,
+                              species=Acoustic_Study@events[[evNum]]@species[["id"]])
+  
+  ## join both dataframes
+  noise_event_spec_df <- cbind(df_noise_meta, df_avgSpec)
+  
+  return(noise_event_spec_df)
+}
+
+```
+
+```{r function to loop through events}
+# function to loop through each event and get noise spectrum
+get_noise_spec <- function(Acoustic_Study, clipping_level, wl) {
+  # create empty data frame to fill
+  noise_spec_df <- data.frame(eventId=c(),species=c())
+  
+  for (i in 1:length(Acoustic_Study@events)) {
+    # run function to calculate SPL differences
+    noise_event_spec_df_tmp <- avgSpec_noise(Acoustic_Study, evNum=Acoustic_Study@events[[i]]@id, 
+                                          clipping_level, wl=wl)
+    # append dataframe
+    noise_spec_df <- rbind(noise_spec_df, noise_event_spec_df_tmp)
+  }
+  return(noise_spec_df)
+}
+
+```
+
+```{r run functions}
+
+## Fisher Islands
+## select only whale events
+fish_dets_whale_filter <- fish_dets_0kHzPP_filter %>% dplyr::filter(species!='NOISE')
+testing_fish_data_noise_df <- get_noise_spec(fish_dets_whale_filter, clipping_level=173, wl=256)
+## save output
+write.csv(testing_fish_data_noise_df, 
+          here('R/spreadsheets/noise_spec/fish_avg_noise_spec.csv'),
+          row.names = FALSE)
+
+## Kong Oscar
+## select only whale events
+kong_dets_whale_filter <- kong_dets_0kHzPP_filter %>% dplyr::filter(species!='NOISE')
+testing_kong_data_noise_df <- get_noise_spec(kong_dets_whale_filter, clipping_level=173, wl=256)
+## save output
+write.csv(testing_kong_data_noise_df, 
+          here('R/spreadsheets/noise_spec/kong_avg_noise_spec.csv'),
+          row.names = FALSE)
+
+```
+
+```{r export example avg specs for manuscript}
+calculateAverageSpectra(fish_dets_whale_filter,evNum='13',wl=256,title="",noise=TRUE)
+
+# narwhal example spectra
+narwhal_avSpec <- calculateAverageSpectra(fish_dets_whale_filter,evNum='669',
+                                          wl=512,title="",noise=FALSE,norm=FALSE)
+narwhal_noise <- calculateAverageSpectra(fish_dets_whale_filter,evNum='669',
+                                         wl=256,title="",noise=TRUE,norm=FALSE)
+
+# export mean spectra
+narwhal_ex_spec <- data.frame(freq=narwhal_avSpec$freq,
+                              avgSpec=narwhal_avSpec$avgSpec)
+write.csv(narwhal_ex_spec, here("R/spreadsheets/ex_spec/narwhal_ex_spec.csv"),row.names = FALSE)
+narwhal_ex_spec_noise <- data.frame(freq=narwhal_noise$freq,
+                                    avgNoise=narwhal_noise$avgNoise)
+write.csv(narwhal_ex_spec_noise, here("R/spreadsheets/ex_spec/narwhal_ex_spec_noise.csv"),row.names = FALSE)
+
+# beluga example spectra
+beluga_avSpec <- calculateAverageSpectra(fish_dets_whale_filter,evNum='1715',
+                                         wl=512,title="",noise=FALSE,norm=FALSE)
+beluga_noise <- calculateAverageSpectra(fish_dets_whale_filter,evNum='1715',
+                                        wl=256,title="",noise=TRUE,norm=FALSE)
+
+# export mean spectra
+beluga_ex_spec <- data.frame(freq=beluga_avSpec$freq, 
+                             avgSpec=beluga_avSpec$avgSpec)
+write.csv(beluga_ex_spec, here("R/spreadsheets/ex_spec/beluga_ex_spec.csv"),row.names = FALSE)
+beluga_ex_spec_noise <- data.frame(freq=beluga_noise$freq,
+                             avgNoise=beluga_noise$avgNoise)
+write.csv(beluga_ex_spec_noise, here("R/spreadsheets/ex_spec/beluga_ex_spec_noise.csv"),row.names = FALSE)
+
+```
+
+
